@@ -11,7 +11,33 @@
  * result is reported back in the tool response, so a wrong guess is visible rather
  * than silent.
  */
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
+
+/* A file this server is pointed at is not necessarily a file of prices.
+ *
+ * `file` is a path, and the thing choosing that path is a language model, which can be
+ * talked into things by whatever it has been reading. So the failure path matters as
+ * much as the happy one: an error that quotes the first line back — "no close column
+ * found. Header was: ..." — turns any unreadable file into a one-line disclosure, and
+ * one line of ~/.ssh/id_rsa or /etc/passwd is worth having.
+ *
+ * Reading the file at all is the point of the tool and stays allowed. Quoting it back
+ * does not. Only fragments that look like column names survive: short, no separators,
+ * no base64 runs. A private key line is one 64-character token and a passwd line is
+ * full of colons and slashes; neither gets through, while `Adj Close` and
+ * `close_price` do. */
+const COLUMN_LIKE = /^[A-Za-z0-9 ._%()-]{1,32}$/;
+const MAX_BYTES = 64 * 1024 * 1024;
+
+function safeColumns(header) {
+  const kept = header
+    .map((h) => String(h).trim().replace(/^"|"$/g, ""))
+    .filter((h) => h && COLUMN_LIKE.test(h))
+    .slice(0, 12);
+  if (!kept.length) return "none of the column names were readable as column names";
+  const more = header.length > kept.length ? `, and ${header.length - kept.length} more` : "";
+  return kept.join(", ") + more;
+}
 
 const ALIASES = {
   t: ["t", "time", "timestamp", "date", "datetime", "dt", "day"],
@@ -68,8 +94,8 @@ export function parseCsv(text) {
   const map = matchColumn(header);
   if (map.c === undefined) {
     throw new Error(
-      `no close column found. Header was: ${header.join(", ")}. ` +
-      `Expected one of: ${ALIASES.c.join(", ")}.`
+      `no close column found among the ${header.length} columns ` +
+      `(${safeColumns(header)}). Expected one of: ${ALIASES.c.join(", ")}.`
     );
   }
 
@@ -140,6 +166,14 @@ export function normaliseInline(input) {
 }
 
 export async function loadFile(path) {
+  const info = await stat(path);
+  if (!info.isFile()) throw new Error(`${path} is not a file`);
+  if (info.size > MAX_BYTES) {
+    throw new Error(
+      `${path} is ${(info.size / 1048576).toFixed(0)} MB; the limit is ` +
+      `${MAX_BYTES / 1048576} MB. Slice the history you need first.`
+    );
+  }
   const text = await readFile(path, "utf8");
   const trimmed = text.trimStart();
   if (trimmed.startsWith("[") || trimmed.startsWith("{")) {

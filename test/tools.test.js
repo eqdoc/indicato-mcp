@@ -137,3 +137,94 @@ test("beta against a benchmark is around one for a scaled copy", async () => {
   const r = await tools.compute({ indicator: "beta", bars, benchmark: scaled, params: { n: 30 }, tail: 1 });
   assert.ok(Math.abs(r.values[0] - 0.5) < 1e-6, `beta was ${r.values[0]}`);
 });
+
+test("an absurd window is refused before it allocates", async () => {
+  await assert.rejects(
+    () => tools.compute({ indicator: "sma", bars, params: { n: 1e12 } }),
+    /beyond the 1000000 limit/
+  );
+});
+
+test("a fractional window is refused rather than silently rounded", async () => {
+  await assert.rejects(
+    () => tools.compute({ indicator: "rsi", bars, params: { n: 14.5 } }),
+    /must be a whole number/
+  );
+  await assert.rejects(
+    () => tools.compute({ indicator: "rsi", bars, params: { n: 0 } }),
+    /whole number of 1 or more/
+  );
+  await assert.rejects(
+    () => tools.compute({ indicator: "macd", bars, params: { slow: -26 } }),
+    /window length/
+  );
+});
+
+test("a fractional multiplier is still allowed", async () => {
+  const r = await tools.compute({ indicator: "bollinger", bars, params: { mult: 1.5 }, tail: 1 });
+  assert.ok(r.values.upper[0] > r.values.mid[0]);
+});
+
+test("a non-numeric parameter is refused", async () => {
+  await assert.rejects(
+    () => tools.compute({ indicator: "rsi", bars, params: { n: "fourteen" } }),
+    /must be a number/
+  );
+});
+
+test("an unreadable file is not quoted back into the error", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "indicato-sec-"));
+  const secret = join(dir, "id_rsa");
+  await writeFile(secret,
+    "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAABlwAAAAdzc2gtcn\n");
+  await assert.rejects(
+    () => tools.compute({ indicator: "rsi", file: secret }),
+    (err) => {
+      assert.match(err.message, /no close column found/);
+      assert.ok(!err.message.includes("BEGIN OPENSSH"), "leaked the header line");
+      assert.ok(!err.message.includes("b3BlbnNzaC1rZXktdjEA"), "leaked key material");
+      return true;
+    }
+  );
+
+  const passwd = join(dir, "passwd");
+  await writeFile(passwd, "root:x:0:0:root:/root:/bin/bash\ndaemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n");
+  await assert.rejects(
+    () => tools.compute({ indicator: "rsi", file: passwd }),
+    (err) => {
+      assert.ok(!err.message.includes("/bin/bash"), "leaked a passwd line");
+      return true;
+    }
+  );
+});
+
+test("a real csv header still comes back, so debugging still works", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "indicato-hdr-"));
+  const path = join(dir, "odd.csv");
+  await writeFile(path, "Date,Open,High,Low,Settlement Price,Volume\n2024-01-01,1,2,3,4,5\n");
+  await assert.rejects(
+    () => tools.compute({ indicator: "rsi", file: path }),
+    /Settlement Price/
+  );
+});
+
+test("a directory is not a file", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "indicato-dir-"));
+  await assert.rejects(() => tools.compute({ indicator: "rsi", file: dir }), /is not a file/);
+});
+
+test("every default the library ships is accepted by the guard", async () => {
+  const rejected = [];
+  for (const e of MANIFEST.values()) {
+    if (!e.params.length) continue;
+    const params = {};
+    for (const p of e.params) if (!p.required) params[p.name] = p.default;
+    if (!Object.keys(params).length) continue;
+    try {
+      await tools.compute({ indicator: e.name, bars, benchmark, params, tail: 1 });
+    } catch (err) {
+      rejected.push(`${e.name}(${JSON.stringify(params)}): ${err.message}`);
+    }
+  }
+  assert.deepEqual(rejected, []);
+});

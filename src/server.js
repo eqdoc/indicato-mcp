@@ -3,11 +3,15 @@
  * stdio MCP server. The transport is thin on purpose — everything interesting is in
  * tools.js, which can be called without a client.
  */
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { createServer } from "./rpc.js";
 import { tools } from "./tools.js";
 import { NAMES } from "./manifest.js";
+import { pathToFileURL } from "node:url";
+import { readFileSync } from "node:fs";
+
+const VERSION = JSON.parse(
+  readFileSync(new URL("../package.json", import.meta.url), "utf8")
+).version;
 
 const BARS_INPUT = {
   bars: {
@@ -102,26 +106,16 @@ const DEFINITIONS = [
   },
 ];
 
-const server = new Server(
-  { name: "indicato-mcp", version: "0.1.0" },
-  { capabilities: { tools: {} } }
-);
-
-server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: DEFINITIONS }));
-
-server.setRequestHandler(CallToolRequestSchema, async (req) => {
-  const fn = tools[req.params.name];
-  if (!fn) {
-    return { isError: true, content: [{ type: "text", text: `unknown tool: ${req.params.name}` }] };
-  }
-  try {
-    const result = await fn(req.params.arguments ?? {});
-    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-  } catch (err) {
-    /* Errors go back as content, not as a protocol failure, so the model can read the
-     * message and correct itself rather than seeing the call disappear. */
-    return { isError: true, content: [{ type: "text", text: err.message }] };
-  }
+export const server = createServer({
+  name: "indicato-mcp",
+  version: VERSION,
+  tools,
+  definitions: DEFINITIONS,
 });
 
-await server.connect(new StdioServerTransport());
+export { DEFINITIONS };
+
+/* Only listen when run as a program, so the tests can drive `server.handle` directly. */
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  server.listen();
+}

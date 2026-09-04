@@ -2,6 +2,7 @@
 
 [![npm](https://img.shields.io/npm/v/indicato-mcp)](https://www.npmjs.com/package/indicato-mcp)
 [![licence](https://img.shields.io/npm/l/indicato-mcp)](./LICENSE)
+[![dependencies](https://img.shields.io/badge/dependencies-1-brightgreen)](./package.json)
 
 An [MCP](https://modelcontextprotocol.io) server that gives an AI assistant the 89
 indicators in [indicato](https://github.com/eqdoc/indicato).
@@ -29,6 +30,12 @@ Or, for any client that reads a JSON config:
 ```
 
 Node 18 or newer. Nothing else to configure.
+
+Its only dependency is `indicato`. The MCP protocol is spoken directly — newline-delimited
+JSON-RPC on stdin and stdout — rather than through the reference SDK, which declares two
+web frameworks, CORS, OAuth PKCE and a JOSE implementation to carry transports this server
+does not use. That was 88 packages behind a process that opens no socket and reads your
+files.
 
 ## Where the data comes from
 
@@ -102,6 +109,18 @@ A wrong indicator name suggests the right one:
 > no indicator named `bollingerbands`. Did you mean: bollinger, bbWidth, bbPercent?
 
 Both are addressed to the model, which reads the message and corrects itself.
+
+## What it can reach
+
+The file system, as you, and nothing else. It opens no network connection.
+
+`file` is a path, and the thing choosing that path is a language model, which can be
+talked into things by what it reads. So a file that fails to parse is not quoted back
+into the error message — only fragments that look like column names survive, which
+`Adj Close` does and a line of a private key does not. Files are capped at 64 MB, and
+window lengths are bounded before anything is allocated.
+
+Point it at a directory of exports and it is useful. It has no more reach than that.
 
 ## Licence
 

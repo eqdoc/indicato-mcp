@@ -77,6 +77,49 @@ async function resolveBars(args) {
   throw new Error("pass either `bars` (inline) or `file` (a path on this machine)");
 }
 
+/* Parameters arrive from a model, so they arrive as whatever the model felt like
+ * sending. A period of 1e12 is not an attack so much as a typo, but it allocates until
+ * the process dies either way, and a fractional period silently produces a series that
+ * is neither the 14 nor the 15 anyone meant.
+ *
+ * Telling a window from a multiplier cannot be done from the default. `mult = 2` is a
+ * whole number and 1.5 is a perfectly good value for it; `n = 20` is a whole number and
+ * 14.5 is not. The names are the only thing that separates them, so the windows are
+ * named explicitly and everything else — mult, sigma, offset, step, and the single
+ * letters, which are ambiguous — is left to the magnitude check alone.
+ *
+ * A list that is too eager is worse than no list: it rejects calls that were fine. */
+const MAX_MAGNITUDE = 1e6;
+const WINDOWS = new Set([
+  "n", "fast", "slow", "signal", "short", "long", "smooth", "cycle", "conv", "base",
+  "spanB", "atrLen", "rsiLen", "rankLen", "streakLen", "barsPerYear", "sig",
+]);
+
+function checkParam(entry, p, value) {
+  if (typeof value !== "number") {
+    if (typeof p.default === "number") {
+      throw new Error(`${entry.name}: \`${p.name}\` must be a number, got ${typeof value}.`);
+    }
+    return value;
+  }
+  if (!Number.isFinite(value)) {
+    throw new Error(`${entry.name}: \`${p.name}\` must be a finite number.`);
+  }
+  if (Math.abs(value) > MAX_MAGNITUDE) {
+    throw new Error(
+      `${entry.name}: \`${p.name}\` is ${value}, beyond the ${MAX_MAGNITUDE} limit. ` +
+      `A window that size cannot be computed from any realistic history.`
+    );
+  }
+  if (WINDOWS.has(p.name) && (!Number.isInteger(value) || value < 1)) {
+    throw new Error(
+      `${entry.name}: \`${p.name}\` is a window length — it must be a whole number of ` +
+      `1 or more, got ${value}.`
+    );
+  }
+  return value;
+}
+
 /* Positional arguments, from a named object, against the parsed signature. Extra keys
  * are an error rather than a shrug: a silently ignored `period` is how someone ends up
  * charting a 14-day RSI they asked to be 21. */
@@ -97,7 +140,7 @@ function orderParams(entry, given = {}) {
     const p = entry.params[i];
     const has = Object.prototype.hasOwnProperty.call(given, p.name);
     if (has) seen = true;
-    if (seen) args[i] = has ? given[p.name] : p.default;
+    if (seen) args[i] = has ? checkParam(entry, p, given[p.name]) : p.default;
   }
   return args.filter((_, i) => i in args);
 }
