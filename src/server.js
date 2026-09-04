@@ -7,7 +7,7 @@ import { createServer } from "./rpc.js";
 import { tools } from "./tools.js";
 import { NAMES } from "./manifest.js";
 import { pathToFileURL } from "node:url";
-import { readFileSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 
 const VERSION = JSON.parse(
   readFileSync(new URL("../package.json", import.meta.url), "utf8")
@@ -115,7 +115,21 @@ export const server = createServer({
 
 export { DEFINITIONS };
 
-/* Only listen when run as a program, so the tests can drive `server.handle` directly. */
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  server.listen();
+/* Only listen when run as a program, so the tests can import this module without it
+ * seizing stdin.
+ *
+ * Both sides have to be resolved through symlinks before they are compared. npm installs
+ * a bin as a link — node_modules/.bin/indicato-mcp -> ../indicato-mcp/src/server.js — so
+ * `process.argv[1]` is the link while `import.meta.url` is its target. Comparing them raw
+ * is false for every real installation and true only when the file is run by its own
+ * path, which is exactly what a test does. It passes everywhere except in use. */
+const entry = process.argv[1];
+if (entry) {
+  let invoked;
+  try {
+    invoked = pathToFileURL(realpathSync(entry)).href;
+  } catch {
+    invoked = pathToFileURL(entry).href;
+  }
+  if (invoked === import.meta.url) server.listen();
 }

@@ -144,3 +144,35 @@ test("nothing but protocol reaches stdout", async () => {
   assert.equal(responses.length, 2);
   assert.equal(stderr, "");
 });
+
+/* npm installs a bin as a symlink, so the entry-point check has to see through one.
+ * Comparing argv[1] to import.meta.url raw is true when a test runs the file by its
+ * real path and false for every actual installation — a bug that passes its own
+ * test suite and ships dead. This runs the server the way a client does. */
+test("the server listens when started through a bin symlink", async () => {
+  const { mkdtemp, symlink, mkdir } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+
+  const dir = await mkdtemp(join(tmpdir(), "indicato-bin-"));
+  await mkdir(join(dir, ".bin"));
+  const link = join(dir, ".bin", "indicato-mcp");
+  await symlink(BIN, link);
+
+  const responses = await new Promise((resolve, reject) => {
+    const p = spawn(process.execPath, [link], { stdio: ["pipe", "pipe", "pipe"] });
+    let out = "";
+    const timer = setTimeout(() => { p.kill(); reject(new Error("no response through the symlink")); }, 15000);
+    p.stdout.on("data", (d) => { out += d; });
+    p.on("close", () => {
+      clearTimeout(timer);
+      resolve(out.split("\n").filter(Boolean).map((l) => JSON.parse(l)));
+    });
+    p.on("error", reject);
+    p.stdin.write(JSON.stringify(INIT) + "\n");
+    p.stdin.end();
+  });
+
+  assert.equal(responses.length, 1, "the server produced no output through the symlink");
+  assert.equal(responses[0].result.serverInfo.name, "indicato-mcp");
+});
