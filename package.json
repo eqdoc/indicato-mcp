@@ -1,13 +1,16 @@
 {
   "name": "indicato-mcp",
-  "version": "0.1.1",
-  "description": "Model Context Protocol server exposing the indicato technical analysis library to AI assistants.",
+  "version": "0.2.0",
+  "description": "Model Context Protocol server exposing the indicato technical analysis library to AI assistants: 89 indicators, 61 candlestick patterns, indicator events and chart patterns.",
   "keywords": [
     "mcp",
     "model-context-protocol",
     "technical-analysis",
     "indicators",
-    "ohlcv"
+    "ohlcv",
+    "candlestick-patterns",
+    "chart-patterns",
+    "ta-lib"
   ],
   "license": "MIT",
   "author": "Harsh Dattani",
@@ -32,6 +35,6 @@
     "test": "node --test 'test/*.test.js'"
   },
   "dependencies": {
-    "indicato": "^0.1.0"
+    "indicato": "0.3.0"
   }
 }

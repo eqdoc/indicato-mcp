@@ -48,17 +48,51 @@ test("an unknown protocol version is answered with ours", async () => {
   assert.equal(responses[0].result.protocolVersion, "2025-06-18");
 });
 
-test("tools/list returns four usable tools", async () => {
+test("tools/list returns eight usable tools", async () => {
   const { responses } = await talk([INIT,
     { jsonrpc: "2.0", method: "notifications/initialized" },
     { jsonrpc: "2.0", id: 2, method: "tools/list" }]);
   const list = responses.find((r) => r.id === 2).result.tools;
   assert.deepEqual(list.map((t) => t.name).sort(),
-    ["compute", "compute_many", "describe_indicator", "list_indicators"]);
+    ["compute", "compute_many", "describe_indicator", "find_candles", "find_events", "find_patterns", "list_candles", "list_indicators"]);
   for (const t of list) {
     assert.equal(t.inputSchema.type, "object", `${t.name} schema`);
     assert.ok(t.description.length > 20, `${t.name} description`);
   }
+});
+
+test("compute and compute_many advertise compat, and the scanners advertise their inputs", async () => {
+  const { responses } = await talk([INIT, { jsonrpc: "2.0", id: 2, method: "tools/list" }]);
+  const by = Object.fromEntries(responses.find((r) => r.id === 2).result.tools.map((t) => [t.name, t]));
+  for (const n of ["compute", "compute_many"]) assert.deepEqual(by[n].inputSchema.properties.compat.enum, ["talib"], n);
+  assert.match(by.compute.inputSchema.properties.compat.description, /sma, rsi|atr, bollinger/);
+  for (const n of ["find_candles", "find_events", "find_patterns"]) {
+    for (const k of ["bars", "file", "tail", "full"]) assert.ok(by[n].inputSchema.properties[k], `${n}.${k}`);
+  }
+  assert.equal(by.find_events.inputSchema.properties.signals.items.enum.length, 11);
+  assert.deepEqual(by.find_candles.inputSchema.properties.set.enum, ["curated", "all"]);
+});
+
+test("a scanner is callable over the wire, from a file", async () => {
+  const { mkdtemp, writeFile } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const dir = await mkdtemp(join(tmpdir(), "indicato-mcp-"));
+  const file = join(dir, "x.csv");
+  const rows = ["Date,Open,High,Low,Close,Volume"];
+  for (let i = 0; i < 80; i++) {
+    const b = 100 + (i % 5);
+    rows.push(`2025-01-${String((i % 28) + 1).padStart(2, "0")},${b},${b + 2},${b - 2},${b + (i % 2 ? 1 : -1)},1000`);
+  }
+  await writeFile(file, rows.join("\n"));
+  const { responses } = await talk([INIT,
+    { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "find_candles", arguments: { file, set: "all", tail: 3 } } }]);
+  const r = responses.find((x) => x.id === 2).result;
+  assert.ok(!r.isError, r.content[0].text);
+  const payload = JSON.parse(r.content[0].text);
+  assert.equal(payload.bars, 80);
+  assert.ok(payload.hits.length <= 3);
+  assert.equal(payload.source.columns.o, "Open");
 });
 
 test("the initialized notification draws no response", async () => {

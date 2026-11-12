@@ -18,6 +18,7 @@
  *                     regex over the body would not be.
  */
 import * as TA from "indicato";
+import { CANDLE_PATTERNS } from "indicato";
 
 const SIG = /^(?:async\s*)?(?:function\s*[\w$]*\s*)?\(([^)]*)\)|^([\w$]+)\s*=>/;
 
@@ -91,11 +92,40 @@ const SERIES_FIRST = new Set(["src", "values", "value", "series", "a", "b", "v",
  * their own input kind and the caller is asked for a benchmark. */
 const PAIR_SECOND = new Set(["b", "y", "benchmark", "market", "index", "other"]);
 
+/* From 0.2 indicato also exports the 61 candlestick functions, three scanners and a few
+ * helpers, and every one of them is a function. They are not indicators: they return
+ * integers per bar, events or patterns, and each has its own tool here. Everything else
+ * that is a function is an indicator, so the sixty-one are taken from the library's own
+ * table and the ten others are named. If a release adds an eleventh, the count in the
+ * tests stops matching and says so. */
+const NOT_INDICATORS = new Set([
+  ...Object.keys(CANDLE_PATTERNS),
+  "candleLookback", "candlesAt", "indicatorEvents", "eventConfirmations", "fractalPivots",
+  "volumeRatio", "chartBars", "detectPatterns", "weeklyBars", "zigzag",
+]);
+
+/* indicato 0.3 puts `opts` last on the nine functions that have a TA-Lib mode. It is not
+ * a parameter anyone sets by name, so it is lifted out of the list and recorded as
+ * `compat`. */
+export const COMPAT_NOTES = {
+  sma: "Divides the running total first, then drops the oldest value (TA-Lib's order).",
+  rsi: "First n changes averaged, first value at bar n (default: bar n-1, seeded one bar earlier).",
+  atr: "Averages true ranges from bar 1 to n, first value at bar n (default: bar 0's range is included).",
+  dmi: "TA-Lib's PLUS_DI, MINUS_DI and ADX: DI from bar n, ADX from bar 2n-1.",
+  macd: "Both EMAs seeded at bar slow-1; line, signal and hist all start at slow+signal-2 (bar 33 by default).",
+  bollinger: "TA-Lib's BBANDS: running-total mean, deviation from the mean of squares less the square of the mean.",
+  stochRsi: "Raw fastk over the last k RSI values and its d-bar mean. `k` is then TA-Lib's fastk_period, whose own default is 5 (this server's default for k stays 3, so pass k: 5 to match talib.STOCHRSI defaults).",
+  psar: "The first leg is decided by the first bar's minus-DM.",
+  supertrend: "No TA-Lib function exists; this is the Supertrend a Python scan writes on talib.ATR: ATR from bar n, first leg a downtrend.",
+};
+
 function build() {
   const out = new Map();
   for (const [name, fn] of Object.entries(TA)) {
-    if (typeof fn !== "function") continue;
-    const params = parseSignature(fn);
+    if (typeof fn !== "function" || NOT_INDICATORS.has(name)) continue;
+    const all = parseSignature(fn);
+    const compat = all.length > 0 && all[all.length - 1].name === "opts";
+    const params = compat ? all.slice(0, -1) : all;
     const [first, second] = params;
     let input = "bars", consumed = 1;
     if (first && SERIES_FIRST.has(first.name)) {
@@ -108,6 +138,7 @@ function build() {
       input,
       inputName: first ? first.name : "bars",
       params: params.slice(consumed),
+      compat,
       output: shape.kind,
       lines: shape.lines,
     });
@@ -142,5 +173,7 @@ export function suggest(name, limit = 6) {
     .sort((a, b) => a[1] - b[1] || a[0].length - b[0].length)
     .slice(0, limit).map(([n]) => n);
 }
+
+export const COMPAT_NAMES = NAMES.filter((n) => MANIFEST.get(n).compat);
 
 export { TA };
