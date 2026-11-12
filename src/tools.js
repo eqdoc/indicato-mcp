@@ -8,10 +8,13 @@
  * the tail plus a summary by default, and the caller has to ask for the whole series
  * on purpose.
  */
-import { MANIFEST, NAMES, get, suggest, TA } from "./manifest.js";
-import { normaliseInline, orderOldestFirst, loadFile } from "./bars.js";
+import { MANIFEST, NAMES, COMPAT_NAMES, COMPAT_NOTES, get, suggest, TA } from "./manifest.js";
+import { scans } from "./scans.js";
+import { normaliseInline, orderOldestFirst, loadFile, resolveBars } from "./bars.js";
 
-const round = (v) => (typeof v === "number" && Number.isFinite(v) ? +v.toFixed(6) : null);
+/* Booleans pass through. supertrend's `up` is an array of them, and rounding them as
+ * numbers turned every one into null (0.1.1 did exactly that). */
+const round = (v) => (typeof v === "boolean" ? v : typeof v === "number" && Number.isFinite(v) ? +v.toFixed(6) : null);
 
 function summarise(series) {
   const vals = series.filter((v) => typeof v === "number" && Number.isFinite(v));
@@ -41,40 +44,6 @@ function shape(out, tail, full) {
     summary[k] = summarise(v);
   }
   return { values, summary };
-}
-
-async function resolveBars(args) {
-  if (args.file) {
-    const loaded = await loadFile(args.file);
-    const ordered = orderOldestFirst(loaded.bars);
-    return {
-      bars: ordered.bars,
-      source: {
-        file: args.file,
-        format: loaded.format,
-        rows: ordered.bars.length,
-        columns: loaded.columns,
-        skippedRows: loaded.skipped || undefined,
-        reversedToOldestFirst: ordered.reversed || undefined,
-        orderChecked: ordered.checked,
-      },
-    };
-  }
-  if (args.bars) {
-    const { bars, fromCloses } = normaliseInline(args.bars);
-    const ordered = orderOldestFirst(bars);
-    return {
-      bars: ordered.bars,
-      source: {
-        inline: true,
-        rows: bars.length,
-        fromClosesOnly: fromCloses || undefined,
-        reversedToOldestFirst: ordered.reversed || undefined,
-        orderChecked: ordered.checked,
-      },
-    };
-  }
-  throw new Error("pass either `bars` (inline) or `file` (a path on this machine)");
 }
 
 /* Parameters arrive from a model, so they arrive as whatever the model felt like
@@ -123,7 +92,7 @@ function checkParam(entry, p, value) {
 /* Positional arguments, from a named object, against the parsed signature. Extra keys
  * are an error rather than a shrug: a silently ignored `period` is how someone ends up
  * charting a 14-day RSI they asked to be 21. */
-function orderParams(entry, given = {}) {
+function orderParams(entry, given = {}, compat = false) {
   const known = new Set(entry.params.map((p) => p.name));
   const unknown = Object.keys(given).filter((k) => !known.has(k));
   if (unknown.length) {
@@ -133,6 +102,18 @@ function orderParams(entry, given = {}) {
         ? `It takes: ${entry.params.map((p) => p.name + (p.required ? "" : ` = ${JSON.stringify(p.default)}`)).join(", ")}.`
         : "It takes no parameters beyond the bars.")
     );
+  }
+  /* The options object is the argument after the last parameter, so in compat mode every
+   * parameter before it is filled in, from the caller or from the default. */
+  if (compat) {
+    const filled = entry.params.map((p) => {
+      if (Object.prototype.hasOwnProperty.call(given, p.name)) return checkParam(entry, p, given[p.name]);
+      if (p.required) {
+        throw new Error(`${entry.name}: \`${p.name}\` has no default; pass it in params.`);
+      }
+      return p.default;
+    });
+    return [...filled, { compat: "talib" }];
   }
   const args = [];
   let seen = false;
@@ -145,7 +126,25 @@ function orderParams(entry, given = {}) {
   return args.filter((_, i) => i in args);
 }
 
-function callOne(entry, bars, params, tail, full, benchmark) {
+/* `compat` is "talib", or nothing. "default" is what the library itself calls the
+ * absence of a mode, so it is accepted and means the same. Naming a mode on an indicator
+ * that has none is refused rather than ignored: the caller asked for TA-Lib's numbers
+ * and would otherwise be handed indicato's own, unlabelled. */
+function resolveCompat(entry, compat) {
+  if (compat === undefined || compat === null || compat === "default") return false;
+  if (compat !== "talib") {
+    throw new Error(`${entry.name}: unknown compat mode ${JSON.stringify(compat)}; the only one is "talib".`);
+  }
+  if (!entry.compat) {
+    throw new Error(
+      `${entry.name} has no TA-Lib compatibility mode. It exists on: ${COMPAT_NAMES.join(", ")}.`
+    );
+  }
+  return true;
+}
+
+function callOne(entry, bars, params, tail, full, benchmark, compat) {
+  const talib = resolveCompat(entry, compat);
   const fn = TA[entry.name];
   const closes = () => bars.map((b) => b.c);
   const args = [];
@@ -166,8 +165,8 @@ function callOne(entry, bars, params, tail, full, benchmark) {
     }
     args.push(benchmark);
   }
-  const out = fn(...args, ...orderParams(entry, params));
-  return { indicator: entry.name, ...shape(out, tail, full) };
+  const out = fn(...args, ...orderParams(entry, params, talib));
+  return { indicator: entry.name, ...(talib ? { compat: "talib" } : {}), ...shape(out, tail, full) };
 }
 
 async function resolveBenchmark(args) {
@@ -183,6 +182,8 @@ async function resolveBenchmark(args) {
 }
 
 export const tools = {
+  ...scans,
+
   list_indicators({ search } = {}) {
     const rows = NAMES.map((n) => MANIFEST.get(n)).filter((e) => {
       if (!search) return true;
@@ -191,12 +192,16 @@ export const tools = {
     });
     return {
       count: rows.length,
-      note: "Call describe_indicator for parameters, or compute directly — defaults are used when params are omitted.",
+      note:
+        "Call describe_indicator for parameters, or compute directly — defaults are used when params are omitted. " +
+        `${COMPAT_NAMES.length} indicators also take compat: "talib". Candlestick patterns, indicator events and ` +
+        "chart patterns are separate tools: list_candles, find_candles, find_events, find_patterns.",
       indicators: rows.map((e) => ({
         name: e.name,
         needs: e.input === "pair" ? "bars + benchmark" : e.input,
         returns: e.output === "object" ? e.lines : "series",
         params: e.params.map((p) => (p.required ? p.name : `${p.name}=${JSON.stringify(p.default)}`)),
+        ...(e.compat ? { compat: ["talib"] } : {}),
       })),
     };
   },
@@ -224,6 +229,13 @@ export const tools = {
       returns: e.output === "object"
         ? { type: "object", lines: e.lines }
         : { type: "array", note: "same length as the input, null through the warmup" },
+      compat: e.compat
+        ? {
+            supported: ["talib"],
+            use: `pass compat: "talib" to compute or compute_many`,
+            effect: "Equals TA-Lib 0.7.1 to 1e-12 on every bar, the first value included. " + COMPAT_NOTES[e.name],
+          }
+        : "none: this indicator has no TA-Lib mode",
     };
   },
 
@@ -238,7 +250,7 @@ export const tools = {
     }
     const { bars, source } = await resolveBars(args);
     const tail = args.tail ?? 10;
-    const result = callOne(e, bars, args.params, tail, args.full === true, await resolveBenchmark(args));
+    const result = callOne(e, bars, args.params, tail, args.full === true, await resolveBenchmark(args), args.compat);
     return {
       ...result,
       params: args.params ?? "defaults",
@@ -257,10 +269,11 @@ export const tools = {
     for (const req of args.indicators ?? []) {
       const name = typeof req === "string" ? req : req.indicator;
       const params = typeof req === "string" ? undefined : req.params;
+      const compat = (typeof req === "string" ? undefined : req.compat) ?? args.compat;
       const e = get(name);
       if (!e) { errors.push({ indicator: name, error: `unknown indicator${suggest(name).length ? `; did you mean ${suggest(name)[0]}?` : ""}` }); continue; }
       try {
-        results.push(callOne(e, bars, params, tail, args.full === true, benchmark));
+        results.push(callOne(e, bars, params, tail, args.full === true, benchmark, compat));
       } catch (err) {
         errors.push({ indicator: name, error: err.message });
       }

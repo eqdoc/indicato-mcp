@@ -95,6 +95,7 @@ export function createServer({ name, version, tools, definitions }) {
 
   function listen(input = process.stdin) {
     let buffer = "";
+    const inflight = new Set();
     input.setEncoding("utf8");
     input.on("data", (chunk) => {
       buffer += chunk;
@@ -112,12 +113,17 @@ export function createServer({ name, version, tools, definitions }) {
         }
         /* Each message is handled as it arrives; a slow file read does not block the
          * next request, and an unhandled rejection must not take the process down. */
-        Promise.resolve(handle(msg)).catch((err) => {
-          fail(msg?.id, INTERNAL_ERROR, err?.message ?? "internal error");
-        });
+        const job = Promise.resolve(handle(msg))
+          .catch((err) => {
+            fail(msg?.id, INTERNAL_ERROR, err?.message ?? "internal error");
+          })
+          .finally(() => inflight.delete(job));
+        inflight.add(job);
       }
     });
-    input.on("end", () => process.exit(0));
+    /* A client that writes its requests and closes stdin has not stopped waiting for the
+     * answers. A file read is asynchronous, so exiting on end alone dropped its reply. */
+    input.on("end", () => Promise.allSettled([...inflight]).then(() => process.exit(0)));
   }
 
   return { handle, listen, isInitialised: () => initialised };

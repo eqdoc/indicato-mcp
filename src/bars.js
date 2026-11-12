@@ -142,27 +142,28 @@ export function normaliseInline(input) {
   /* A bare array of numbers is a close series; wrap it so every indicator that only
    * reads `c` still works. */
   if (typeof input[0] === "number") {
-    return { bars: input.map((c) => ({ o: c, h: c, l: c, c })), fromCloses: true };
+    return { bars: input.map((c) => ({ o: c, h: c, l: c, c })), fromCloses: true, lacks: ["o", "h", "l", "v"] };
   }
+
+  const lacks = new Set();
 
   const bars = input.map((b, i) => {
     const c = b.c ?? b.close ?? b.Close;
     if (typeof c !== "number" || !Number.isFinite(c)) {
       throw new Error(`bar ${i} has no numeric close`);
     }
-    const out = {
-      o: b.o ?? b.open ?? b.Open ?? c,
-      h: b.h ?? b.high ?? b.High ?? c,
-      l: b.l ?? b.low ?? b.Low ?? c,
-      c,
-    };
+    const o = b.o ?? b.open ?? b.Open, h = b.h ?? b.high ?? b.High, l = b.l ?? b.low ?? b.Low;
+    if (o === undefined) lacks.add("o");
+    if (h === undefined) lacks.add("h");
+    if (l === undefined) lacks.add("l");
+    const out = { o: o ?? c, h: h ?? c, l: l ?? c, c };
     const v = b.v ?? b.volume ?? b.Volume;
-    if (typeof v === "number") out.v = v;
+    if (typeof v === "number") out.v = v; else lacks.add("v");
     const t = b.t ?? b.time ?? b.date ?? b.Date;
     if (t !== undefined) out.t = t;
     return out;
   });
-  return { bars, fromCloses: false };
+  return { bars, fromCloses: false, lacks: [...lacks] };
 }
 
 export async function loadFile(path) {
@@ -180,8 +181,67 @@ export async function loadFile(path) {
     const json = JSON.parse(text);
     const arr = Array.isArray(json) ? json : json.bars ?? json.data ?? json.candles;
     if (!Array.isArray(arr)) throw new Error("JSON file has no array of bars");
-    const { bars } = normaliseInline(arr);
-    return { bars, columns: null, skipped: 0, format: "json" };
+    const { bars, lacks } = normaliseInline(arr);
+    return { bars, columns: null, skipped: 0, format: "json", lacks };
   }
-  return { ...parseCsv(text), format: "csv" };
+  const csv = parseCsv(text);
+  return { ...csv, format: "csv", lacks: ["o", "h", "l", "v"].filter((k) => !(k in csv.columns)) };
+}
+
+/* Bars from either source, oldest first, plus what the source did not supply.
+ *
+ * `lacks` matters to the tools that read the open, high, low or volume: where one is
+ * missing it was filled from the close, and a candlestick scan over bars whose open,
+ * high and low are all the close finds a doji everywhere and nothing else. Those tools
+ * check `lacks` and refuse; the indicators that only read the close do not need to. */
+export async function resolveBars(args) {
+  if (args.file) {
+    const loaded = await loadFile(args.file);
+    const ordered = orderOldestFirst(loaded.bars);
+    return {
+      bars: ordered.bars,
+      lacks: loaded.lacks,
+      source: {
+        file: args.file,
+        format: loaded.format,
+        rows: ordered.bars.length,
+        columns: loaded.columns,
+        skippedRows: loaded.skipped || undefined,
+        reversedToOldestFirst: ordered.reversed || undefined,
+        orderChecked: ordered.checked,
+      },
+    };
+  }
+  if (args.bars) {
+    const { bars, fromCloses, lacks } = normaliseInline(args.bars);
+    const ordered = orderOldestFirst(bars);
+    return {
+      bars: ordered.bars,
+      lacks,
+      source: {
+        inline: true,
+        rows: bars.length,
+        fromClosesOnly: fromCloses || undefined,
+        reversedToOldestFirst: ordered.reversed || undefined,
+        orderChecked: ordered.checked,
+      },
+    };
+  }
+  throw new Error("pass either `bars` (inline) or `file` (a path on this machine)");
+}
+
+/* The calendar day of a bar's timestamp as YYYY-MM-DD, or null. The chart-pattern
+ * detector builds weekly bars from dates and wants ISO days; an ISO string is taken at
+ * its word (no timezone shift), anything else goes through Date and is read back in the
+ * same local zone it was parsed in. */
+export function isoDay(t) {
+  if (typeof t === "string") {
+    const m = t.trim().match(/^(\d{4}-\d{2}-\d{2})(?:$|[T ])/);
+    if (m && Number.isFinite(Date.parse(m[1]))) return m[1];
+  }
+  const ms = typeof t === "number" ? (t < 1e11 ? t * 1000 : t) : Date.parse(t);
+  if (!Number.isFinite(ms)) return null;
+  const d = new Date(ms);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
 }
