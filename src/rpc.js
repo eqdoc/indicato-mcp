@@ -27,11 +27,26 @@ const INVALID_REQUEST = -32600;
 const METHOD_NOT_FOUND = -32601;
 const INTERNAL_ERROR = -32603;
 
-export function createServer({ name, version, tools, definitions }) {
+/* Inline `bars` is meant for short histories; anything multi-megabyte belongs in a file.
+ * Bounding a single NDJSON line before buffering stops a newline-less stream from growing
+ * V8's heap without bound, and capping concurrent tool calls stops pipelined `file`
+ * requests from multiplying the 64 MB file ceiling across dozens of parallel reads. */
+export const MAX_LINE_BYTES = 16 * 1024 * 1024;
+export const MAX_CONCURRENT = 4;
+
+export function createServer({
+  name,
+  version,
+  tools,
+  definitions,
+  output = process.stdout,
+  maxLineBytes = MAX_LINE_BYTES,
+  maxConcurrent = MAX_CONCURRENT,
+}) {
   let initialised = false;
 
   function send(msg) {
-    process.stdout.write(JSON.stringify(msg) + "\n");
+    output.write(JSON.stringify(msg) + "\n");
   }
 
   function reply(id, result) {
@@ -43,6 +58,9 @@ export function createServer({ name, version, tools, definitions }) {
   }
 
   async function handle(msg) {
+    if (!msg || typeof msg !== "object" || Array.isArray(msg)) {
+      return send({ jsonrpc: "2.0", id: null, error: { code: INVALID_REQUEST, message: "not a JSON-RPC 2.0 request" } });
+    }
     const { id, method, params } = msg;
 
     if (msg.jsonrpc !== "2.0" || typeof method !== "string") {
@@ -74,10 +92,15 @@ export function createServer({ name, version, tools, definitions }) {
         return reply(id, { tools: definitions });
 
       case "tools/call": {
-        const fn = tools[params?.name];
-        if (!fn) return fail(id, METHOD_NOT_FOUND, `unknown tool: ${params?.name}`);
+        const toolName = params?.name;
+        const fn = typeof toolName === "string" && Object.hasOwn(tools, toolName) ? tools[toolName] : undefined;
+        if (typeof fn !== "function") return fail(id, METHOD_NOT_FOUND, `unknown tool: ${String(toolName)}`);
+        const args = params?.arguments ?? {};
+        if (typeof args !== "object" || args === null || Array.isArray(args)) {
+          return fail(id, INVALID_REQUEST, "tool arguments must be an object");
+        }
         try {
-          const result = await fn(params.arguments ?? {});
+          const result = await fn(args);
           return reply(id, { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] });
         } catch (err) {
           /* A bad argument is the model's mistake to correct, not a transport failure.
@@ -93,37 +116,123 @@ export function createServer({ name, version, tools, definitions }) {
     }
   }
 
-  function listen(input = process.stdin) {
+  function listen(input = process.stdin, { exitOnEnd = true } = {}) {
     let buffer = "";
+    let bufferBytes = 0;
+    let dropping = false;
+    let active = 0;
+    let paused = false;
+    const waiters = [];
     const inflight = new Set();
+
+    function acquire() {
+      if (active < maxConcurrent) {
+        active++;
+        return Promise.resolve();
+      }
+      return new Promise((resolve) => waiters.push(resolve));
+    }
+
+    function release() {
+      const next = waiters.shift();
+      if (next) next();
+      else active--;
+    }
+
+    function enqueue(msg) {
+      const run = async () => {
+        await acquire();
+        try {
+          await handle(msg);
+        } catch (err) {
+          fail(msg?.id, INTERNAL_ERROR, err?.message ?? "internal error");
+        } finally {
+          release();
+        }
+      };
+      const job = run().finally(() => {
+        inflight.delete(job);
+        if (paused && inflight.size <= maxConcurrent && typeof input.resume === "function") {
+          paused = false;
+          input.resume();
+        }
+      });
+      inflight.add(job);
+      if (!paused && inflight.size >= maxConcurrent * 4 && typeof input.pause === "function") {
+        paused = true;
+        input.pause();
+      }
+    }
+
+    function dispatchLine(line) {
+      if (!line) return;
+      let msg;
+      try {
+        msg = JSON.parse(line);
+      } catch {
+        send({ jsonrpc: "2.0", id: null, error: { code: PARSE_ERROR, message: "invalid JSON" } });
+        return;
+      }
+      enqueue(msg);
+    }
+
     input.setEncoding("utf8");
     input.on("data", (chunk) => {
-      buffer += chunk;
-      let nl;
-      while ((nl = buffer.indexOf("\n")) !== -1) {
-        const line = buffer.slice(0, nl).trim();
-        buffer = buffer.slice(nl + 1);
-        if (!line) continue;
-        let msg;
-        try {
-          msg = JSON.parse(line);
-        } catch {
-          send({ jsonrpc: "2.0", id: null, error: { code: PARSE_ERROR, message: "invalid JSON" } });
+      let rest = chunk;
+      while (rest.length > 0) {
+        if (dropping) {
+          const nl = rest.indexOf("\n");
+          if (nl === -1) break;
+          rest = rest.slice(nl + 1);
+          dropping = false;
           continue;
         }
-        /* Each message is handled as it arrives; a slow file read does not block the
-         * next request, and an unhandled rejection must not take the process down. */
-        const job = Promise.resolve(handle(msg))
-          .catch((err) => {
-            fail(msg?.id, INTERNAL_ERROR, err?.message ?? "internal error");
-          })
-          .finally(() => inflight.delete(job));
-        inflight.add(job);
+
+        const nl = rest.indexOf("\n");
+        if (nl === -1) {
+          const chunkBytes = Buffer.byteLength(rest, "utf8");
+          if (bufferBytes + chunkBytes > maxLineBytes) {
+            buffer = "";
+            bufferBytes = 0;
+            dropping = true;
+            send({ jsonrpc: "2.0", id: null, error: { code: INVALID_REQUEST, message: `request exceeds ${maxLineBytes} bytes` } });
+            break;
+          }
+          buffer += rest;
+          bufferBytes += chunkBytes;
+          break;
+        }
+
+        const head = rest.slice(0, nl);
+        rest = rest.slice(nl + 1);
+        const headBytes = Buffer.byteLength(head, "utf8");
+        if (bufferBytes + headBytes > maxLineBytes) {
+          buffer = "";
+          bufferBytes = 0;
+          send({ jsonrpc: "2.0", id: null, error: { code: INVALID_REQUEST, message: `request exceeds ${maxLineBytes} bytes` } });
+          continue;
+        }
+
+        const line = (buffer + head).trim();
+        buffer = "";
+        bufferBytes = 0;
+        dispatchLine(line);
       }
     });
+
     /* A client that writes its requests and closes stdin has not stopped waiting for the
      * answers. A file read is asynchronous, so exiting on end alone dropped its reply. */
-    input.on("end", () => Promise.allSettled([...inflight]).then(() => process.exit(0)));
+    const done = new Promise((resolve) => {
+      input.on("end", async () => {
+        while (inflight.size > 0) {
+          await Promise.allSettled([...inflight]);
+        }
+        resolve();
+        if (exitOnEnd) process.exit(0);
+      });
+    });
+
+    return done;
   }
 
   return { handle, listen, isInitialised: () => initialised };

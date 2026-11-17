@@ -50,6 +50,14 @@ const dateOf = (bar) => (bar.t === undefined ? undefined : String(bar.t));
 /* Newest `tail` of an oldest-first list, or all of it. */
 const newest = (list, tail, full) => (full ? list : list.slice(-tail));
 
+function resolveTail(tail) {
+  if (tail === undefined) return 10;
+  if (typeof tail !== "number" || !Number.isInteger(tail) || tail < 1) {
+    throw new Error("`tail` must be a whole number of 1 or more.");
+  }
+  return tail;
+}
+
 function nearest(name, pool) {
   const q = String(name).toLowerCase().replace(/[^a-z0-9]/g, "");
   if (!q) return [];
@@ -104,7 +112,7 @@ export const scans = {
       names = set === "all" ? CANDLE_NAMES : CURATED_CANDLES;
     }
 
-    const tail = args.tail ?? 10;
+    const tail = resolveTail(args.tail);
     const hits = [];
     const byPattern = {};
     for (const name of names) {
@@ -146,7 +154,7 @@ export const scans = {
       ? EVENT_KEYS
       : pick(Array.isArray(args.signals) ? args.signals : [args.signals], "event signal", EVENT_KEYS);
 
-    const tail = args.tail ?? 10;
+    const tail = resolveTail(args.tail);
     const found = indicatorEvents(bars);
     const summary = {};
     const events = [];
@@ -190,7 +198,7 @@ export const scans = {
       if (!d) {
         throw new Error(
           `find_patterns needs a date on every bar to build weekly bars and place each point; bar ${i} ` +
-          (b.t === undefined ? "has none." : `has an unreadable one (${JSON.stringify(String(b.t)).slice(0, 40)}).`) +
+          (b.t === undefined ? "has none." : "has an unreadable one.") +
           " Use a CSV with a date column, or bars with a `date` field (YYYY-MM-DD)."
         );
       }
@@ -201,7 +209,7 @@ export const scans = {
     if (args.state !== undefined) {
       state = pick(Array.isArray(args.state) ? args.state : [args.state], "state", STATES);
     }
-    const tail = args.tail ?? 10;
+    const tail = resolveTail(args.tail);
     const withGeometry = args.geometry !== false;
     const all = detectPatterns(rows, { weekly: args.weekly !== false });
 

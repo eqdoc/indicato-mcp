@@ -11,27 +11,167 @@
  * result is reported back in the tool response, so a wrong guess is visible rather
  * than silent.
  */
-import { readFile, stat } from "node:fs/promises";
+import { readFile, realpath, stat } from "node:fs/promises";
+import { basename, extname, isAbsolute, relative, resolve } from "node:path";
 
 /* A file this server is pointed at is not necessarily a file of prices.
  *
  * `file` is a path, and the thing choosing that path is a language model, which can be
- * talked into things by whatever it has been reading. So the failure path matters as
- * much as the happy one: an error that quotes the first line back — "no close column
- * found. Header was: ..." — turns any unreadable file into a one-line disclosure, and
- * one line of ~/.ssh/id_rsa or /etc/passwd is worth having.
+ * talked into things by whatever it has been reading. Three layers keep an untrusted
+ * path from turning into file disclosure:
  *
- * Reading the file at all is the point of the tool and stays allowed. Quoting it back
- * does not. Only fragments that look like column names survive: short, no separators,
- * no base64 runs. A private key line is one 64-character token and a passwd line is
- * full of colons and slashes; neither gets through, while `Adj Close` and
- * `close_price` do. */
-const COLUMN_LIKE = /^[A-Za-z0-9 ._%()-]{1,32}$/;
-const MAX_BYTES = 64 * 1024 * 1024;
+ *   1. Before touching the filesystem, paths are restricted to tabular/JSON extensions
+ *      (.csv, .tsv, .txt, .json), hidden dotfiles and credential directories (.ssh,
+ *      .aws, .gnupg, .config, .env, ...) are refused, and when a root directory is
+ *      configured (--root or INDICATO_ROOT), symlinks are resolved and confined inside
+ *      that root.
+ *   2. After reading, neither CSV headers nor parse failures quote arbitrary file text
+ *      back. Only short tokens shaped like column names survive into `source.columns`
+ *      or error diagnostics, and JSON syntax errors do not echo V8's input snippet.
+ *   3. Date columns only carry values that actually parse as dates or epochs, so prose
+ *      or secrets in a text column never ride out in `lastBar.date` or scan hits. */
+const COLUMN_LIKE = /^[A-Za-z0-9][A-Za-z0-9 ._%()*#-]{0,31}$/;
+const DATE_LIKE = /^[0-9A-Za-z:/., +_-]{1,40}$/;
+const EPOCH_LIKE = /^\d{9,14}(?:\.\d+)?$/;
+export const MAX_BYTES = 64 * 1024 * 1024;
+export const ALLOWED_EXTENSIONS = new Set([".csv", ".tsv", ".txt", ".json"]);
+
+const SENSITIVE_DIRS = new Set([
+  ".ssh", ".aws", ".gnupg", ".config", ".docker", ".kube", ".azure",
+  ".gcloud", ".pki", ".npm", ".netrc", ".password-store", ".vault", ".git",
+]);
+const SYSTEM_PREFIXES = ["/proc/", "/sys/", "/dev/"];
+
+let configuredRoot = null;
+
+export function setAllowedRoot(dir) {
+  configuredRoot = dir ? resolve(dir) : null;
+}
+
+function activeRoot() {
+  if (configuredRoot) return configuredRoot;
+  const env = process.env.INDICATO_ROOT?.trim();
+  return env || null;
+}
+
+function isWithinRoot(target, root) {
+  const rel = relative(root, target);
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+function checkPathRestrictions(filePath) {
+  const normalized = filePath.replace(/\\/g, "/");
+  for (const prefix of SYSTEM_PREFIXES) {
+    if (normalized.startsWith(prefix) || normalized.includes(`/private${prefix}`)) {
+      throw new Error("refusing to read from system virtual filesystem");
+    }
+  }
+  const base = basename(filePath);
+  if (base.startsWith(".") && base !== "." && base !== "..") {
+    throw new Error("refusing to read hidden file; expected a .csv, .tsv, .txt or .json export");
+  }
+  const segments = normalized.split("/").filter(Boolean);
+  for (const seg of segments) {
+    const lower = seg.toLowerCase();
+    if (SENSITIVE_DIRS.has(lower) || lower.startsWith(".env")) {
+      throw new Error("refusing to read from restricted directory or credential path");
+    }
+  }
+  const ext = extname(base).toLowerCase();
+  if (!ALLOWED_EXTENSIONS.has(ext)) {
+    throw new Error(
+      "unsupported file extension; pass a .csv, .tsv, .txt or .json file of bars"
+    );
+  }
+}
+
+function cleanFsError(err, fallback) {
+  const code = err?.code;
+  if (code === "ENOENT") return new Error("file not found");
+  if (code === "EACCES" || code === "EPERM") return new Error("permission denied");
+  if (code === "EISDIR") return new Error("path is not a file");
+  if (code === "ENOTDIR") return new Error("invalid directory component in file path");
+  return new Error(fallback);
+}
+
+async function resolveSafePath(rawPath) {
+  if (typeof rawPath !== "string" || !rawPath.trim()) {
+    throw new Error("file path must be a non-empty string");
+  }
+  if (rawPath.includes("\0")) {
+    throw new Error("invalid file path");
+  }
+
+  const allowAny = process.env.INDICATO_ALLOW_ANY === "1";
+  if (!allowAny) {
+    checkPathRestrictions(rawPath);
+  }
+
+  const root = activeRoot();
+  if (root) {
+    const rootResolved = resolve(root);
+    let rootReal;
+    try {
+      rootReal = await realpath(rootResolved);
+    } catch {
+      throw new Error("configured root directory is not accessible");
+    }
+
+    const lexCandidate = resolve(rootResolved, rawPath);
+    const lexInside =
+      isWithinRoot(lexCandidate, rootResolved) ||
+      isWithinRoot(resolve(rootReal, rawPath), rootReal);
+
+    if (!lexInside && !isAbsolute(rawPath)) {
+      throw new Error("file path is outside the allowed root directory");
+    }
+
+    let targetReal;
+    try {
+      targetReal = await realpath(lexCandidate);
+    } catch (err) {
+      if (!lexInside) {
+        throw new Error("file path is outside the allowed root directory");
+      }
+      throw cleanFsError(err, "unable to access file");
+    }
+    if (!isWithinRoot(targetReal, rootReal)) {
+      throw new Error(
+        lexInside
+          ? "file path escapes the allowed root directory"
+          : "file path is outside the allowed root directory"
+      );
+    }
+    if (!allowAny) {
+      checkPathRestrictions(targetReal);
+    }
+    return targetReal;
+  }
+
+  let targetReal;
+  try {
+    targetReal = await realpath(resolve(rawPath));
+  } catch (err) {
+    throw cleanFsError(err, "unable to access file");
+  }
+  if (!allowAny) {
+    checkPathRestrictions(targetReal);
+  }
+  return targetReal;
+}
+
+function cleanHeaderCell(h) {
+  return String(h).trim().replace(/^"|"$/g, "").trim();
+}
+
+function safeColumnName(raw) {
+  const cleaned = cleanHeaderCell(raw);
+  return cleaned && COLUMN_LIKE.test(cleaned) ? cleaned : "(redacted)";
+}
 
 function safeColumns(header) {
   const kept = header
-    .map((h) => String(h).trim().replace(/^"|"$/g, ""))
+    .map(cleanHeaderCell)
     .filter((h) => h && COLUMN_LIKE.test(h))
     .slice(0, 12);
   if (!kept.length) return "none of the column names were readable as column names";
@@ -49,21 +189,41 @@ const ALIASES = {
 };
 
 function matchColumn(header) {
-  const norm = header.map((h) => String(h).trim().toLowerCase().replace(/^"|"$/g, ""));
+  const cleaned = header.map(cleanHeaderCell);
+  const norm = cleaned.map((h) => h.toLowerCase());
   const map = {};
+  const used = new Set();
+
+  /* Pass 1: exact normalized alias match, so `Close` beats `Adj Close` when both exist. */
   for (const [key, names] of Object.entries(ALIASES)) {
-    /* Exact alias first; only then a looser contains-match, so `close` beats
-     * `adj close` when both are present. */
-    let idx = norm.findIndex((h) => names.includes(h));
-    if (idx === -1) idx = norm.findIndex((h) => names.some((n) => n.length > 1 && h.includes(n)));
-    if (idx !== -1) map[key] = idx;
+    const idx = norm.findIndex((h, i) => !used.has(i) && names.includes(h));
+    if (idx !== -1) {
+      map[key] = idx;
+      used.add(idx);
+    }
+  }
+
+  /* Pass 2: whole-word token match on column-shaped headers only, for multi-letter
+   * aliases (>= 3 chars) so short substrings like `dt` never match `width` or prose. */
+  for (const [key, names] of Object.entries(ALIASES)) {
+    if (key in map) continue;
+    const wordAliases = new Set(names.filter((n) => n.length >= 3 && !n.includes(" ")));
+    const idx = norm.findIndex((h, i) => {
+      if (used.has(i) || !COLUMN_LIKE.test(cleaned[i])) return false;
+      const tokens = h.split(/[\s_.\-()/*#%]+/).filter(Boolean);
+      return tokens.some((tok) => wordAliases.has(tok));
+    });
+    if (idx !== -1) {
+      map[key] = idx;
+      used.add(idx);
+    }
   }
   return map;
 }
 
-/* A CSV parser that handles quoted fields and nothing else. Anything more elaborate
+/* A CSV/TSV parser that handles quoted fields and nothing else. Anything more elaborate
  * would be a dependency, and this reads price data, not arbitrary documents. */
-function splitRow(line) {
+function splitRow(line, sep = ",") {
   const out = [];
   let cur = "", quoted = false;
   for (let i = 0; i < line.length; i++) {
@@ -73,7 +233,7 @@ function splitRow(line) {
       else if (ch === '"') quoted = false;
       else cur += ch;
     } else if (ch === '"') quoted = true;
-    else if (ch === ",") { out.push(cur); cur = ""; }
+    else if (ch === sep) { out.push(cur); cur = ""; }
     else cur += ch;
   }
   out.push(cur);
@@ -86,11 +246,18 @@ const num = (s) => {
   return Number.isFinite(v) ? v : null;
 };
 
+function plausibleDate(s) {
+  if (!s || !DATE_LIKE.test(s)) return false;
+  if (EPOCH_LIKE.test(s)) return true;
+  return Number.isFinite(Date.parse(s));
+}
+
 export function parseCsv(text) {
   const lines = text.split(/\r?\n/).filter((l) => l.trim() !== "");
   if (!lines.length) throw new Error("the file is empty");
 
-  const header = splitRow(lines[0]);
+  const sep = !lines[0].includes(",") && lines[0].includes("\t") ? "\t" : ",";
+  const header = splitRow(lines[0], sep);
   const map = matchColumn(header);
   if (map.c === undefined) {
     throw new Error(
@@ -102,7 +269,7 @@ export function parseCsv(text) {
   const bars = [];
   const skipped = [];
   for (let i = 1; i < lines.length; i++) {
-    const row = splitRow(lines[i]);
+    const row = splitRow(lines[i], sep);
     const c = num(row[map.c]);
     if (c === null) { skipped.push(i + 1); continue; }
     const bar = {
@@ -112,14 +279,17 @@ export function parseCsv(text) {
       c,
     };
     if (map.v !== undefined) bar.v = num(row[map.v]) ?? 0;
-    if (map.t !== undefined) bar.t = String(row[map.t]).trim();
+    if (map.t !== undefined && row[map.t] !== undefined) {
+      const rawT = cleanHeaderCell(row[map.t]);
+      if (plausibleDate(rawT)) bar.t = rawT;
+    }
     bars.push(bar);
   }
   if (!bars.length) throw new Error("no rows with a numeric close");
 
   return {
     bars,
-    columns: Object.fromEntries(Object.entries(map).map(([k, i]) => [k, header[i]])),
+    columns: Object.fromEntries(Object.entries(map).map(([k, i]) => [k, safeColumnName(header[i])])),
     skipped: skipped.length,
   };
 }
@@ -148,6 +318,9 @@ export function normaliseInline(input) {
   const lacks = new Set();
 
   const bars = input.map((b, i) => {
+    if (!b || typeof b !== "object") {
+      throw new Error(`bar ${i} has no numeric close`);
+    }
     const c = b.c ?? b.close ?? b.Close;
     if (typeof c !== "number" || !Number.isFinite(c)) {
       throw new Error(`bar ${i} has no numeric close`);
@@ -166,26 +339,42 @@ export function normaliseInline(input) {
   return { bars, fromCloses: false, lacks: [...lacks] };
 }
 
-export async function loadFile(path) {
-  const info = await stat(path);
-  if (!info.isFile()) throw new Error(`${path} is not a file`);
+export async function loadFile(rawPath) {
+  const safePath = await resolveSafePath(rawPath);
+  let info;
+  try {
+    info = await stat(safePath);
+  } catch (err) {
+    throw cleanFsError(err, "unable to stat file");
+  }
+  if (!info.isFile()) throw new Error("path is not a file");
   if (info.size > MAX_BYTES) {
     throw new Error(
-      `${path} is ${(info.size / 1048576).toFixed(0)} MB; the limit is ` +
-      `${MAX_BYTES / 1048576} MB. Slice the history you need first.`
+      `file exceeds the ${MAX_BYTES / 1048576} MB limit. Slice the history you need first.`
     );
   }
-  const text = await readFile(path, "utf8");
+  let text;
+  try {
+    text = await readFile(safePath, "utf8");
+  } catch (err) {
+    throw cleanFsError(err, "unable to read file");
+  }
   const trimmed = text.trimStart();
-  if (trimmed.startsWith("[") || trimmed.startsWith("{")) {
-    const json = JSON.parse(text);
-    const arr = Array.isArray(json) ? json : json.bars ?? json.data ?? json.candles;
+  const isJsonExt = extname(safePath).toLowerCase() === ".json";
+  if (isJsonExt || trimmed.startsWith("[") || trimmed.startsWith("{")) {
+    let json;
+    try {
+      json = JSON.parse(text);
+    } catch {
+      throw new Error("invalid JSON in bars file");
+    }
+    const arr = Array.isArray(json) ? json : json?.bars ?? json?.data ?? json?.candles;
     if (!Array.isArray(arr)) throw new Error("JSON file has no array of bars");
     const { bars, lacks } = normaliseInline(arr);
     return { bars, columns: null, skipped: 0, format: "json", lacks };
   }
   const csv = parseCsv(text);
-  return { ...csv, format: "csv", lacks: ["o", "h", "l", "v"].filter((k) => !(k in csv.columns)) };
+  return { ...csv, format: "csv", lacks: ["o", "h", "l", "v"].filter((k) => !Object.hasOwn(csv.columns, k)) };
 }
 
 /* Bars from either source, oldest first, plus what the source did not supply.

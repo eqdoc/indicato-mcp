@@ -58,10 +58,19 @@ function shape(out, tail, full) {
  * letters, which are ambiguous — is left to the magnitude check alone.
  *
  * A list that is too eager is worse than no list: it rejects calls that were fine. */
-const MAX_MAGNITUDE = 1e6;
+export const MAX_MAGNITUDE = 1e6;
+export const MAX_WINDOW = 100_000;
+export const MAX_INDICATORS = 50;
+
+/* Every integer period parameter across all 89 functions in indicato, including the
+ * single-letter windows on stochastic/stochRsi (k, d), ultosc (s, m, l),
+ * chandeKrollStop (p, q), coppock (a, b), massIndex (e) and williamsFractals (w).
+ * Float multipliers and factors (mult, offset, sigma, pct, step, max, x, v, dp) are
+ * intentionally left out so fractional values keep working. */
 const WINDOWS = new Set([
   "n", "fast", "slow", "signal", "short", "long", "smooth", "cycle", "conv", "base",
   "spanB", "atrLen", "rsiLen", "rankLen", "streakLen", "barsPerYear", "sig",
+  "k", "d", "s", "m", "l", "p", "q", "a", "b", "e", "w",
 ]);
 
 function checkParam(entry, p, value) {
@@ -80,13 +89,28 @@ function checkParam(entry, p, value) {
       `A window that size cannot be computed from any realistic history.`
     );
   }
-  if (WINDOWS.has(p.name) && (!Number.isInteger(value) || value < 1)) {
-    throw new Error(
-      `${entry.name}: \`${p.name}\` is a window length — it must be a whole number of ` +
-      `1 or more, got ${value}.`
-    );
+  if (WINDOWS.has(p.name)) {
+    if (!Number.isInteger(value) || value < 1) {
+      throw new Error(
+        `${entry.name}: \`${p.name}\` is a window length — it must be a whole number of ` +
+        `1 or more, got ${value}.`
+      );
+    }
+    if (p.name !== "barsPerYear" && value > MAX_WINDOW) {
+      throw new Error(
+        `${entry.name}: \`${p.name}\` is ${value}, beyond the ${MAX_WINDOW} window limit.`
+      );
+    }
   }
   return value;
+}
+
+function resolveTail(tail) {
+  if (tail === undefined) return 10;
+  if (typeof tail !== "number" || !Number.isInteger(tail) || tail < 1) {
+    throw new Error("`tail` must be a whole number of 1 or more.");
+  }
+  return tail;
 }
 
 /* Positional arguments, from a named object, against the parsed signature. Extra keys
@@ -248,8 +272,8 @@ export const tools = {
         (near.length ? ` Did you mean: ${near.join(", ")}?` : " Call list_indicators to see all 89.")
       );
     }
+    const tail = resolveTail(args.tail);
     const { bars, source } = await resolveBars(args);
-    const tail = args.tail ?? 10;
     const result = callOne(e, bars, args.params, tail, args.full === true, await resolveBenchmark(args), args.compat);
     return {
       ...result,
@@ -262,11 +286,23 @@ export const tools = {
   /* One read of the data, several indicators off it. A model comparing RSI against
    * MACD against ATR would otherwise send the same 5,000 bars three times. */
   async compute_many(args) {
+    if (!Array.isArray(args.indicators) || !args.indicators.length) {
+      throw new Error("`indicators` must be a non-empty array.");
+    }
+    if (args.indicators.length > MAX_INDICATORS) {
+      throw new Error(
+        `compute_many accepts at most ${MAX_INDICATORS} indicators per call, got ${args.indicators.length}.`
+      );
+    }
+    const tail = resolveTail(args.tail);
     const { bars, source } = await resolveBars(args);
-    const tail = args.tail ?? 10;
     const benchmark = await resolveBenchmark(args);
     const results = [], errors = [];
-    for (const req of args.indicators ?? []) {
+    for (const req of args.indicators) {
+      if (!req || (typeof req !== "string" && typeof req !== "object")) {
+        errors.push({ indicator: String(req), error: "invalid indicator entry" });
+        continue;
+      }
       const name = typeof req === "string" ? req : req.indicator;
       const params = typeof req === "string" ? undefined : req.params;
       const compat = (typeof req === "string" ? undefined : req.compat) ?? args.compat;
@@ -278,6 +314,11 @@ export const tools = {
         errors.push({ indicator: name, error: err.message });
       }
     }
-    return { source, showing: `last ${Math.min(tail, bars.length)} of ${bars.length}`, results, errors: errors.length ? errors : undefined };
+    return {
+      source,
+      showing: args.full ? `all ${bars.length} values` : `last ${Math.min(tail, bars.length)} of ${bars.length}`,
+      results,
+      errors: errors.length ? errors : undefined,
+    };
   },
 };

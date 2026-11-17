@@ -4,11 +4,12 @@
  * tools.js, which can be called without a client.
  */
 import { createServer } from "./rpc.js";
-import { tools } from "./tools.js";
+import { tools, MAX_INDICATORS } from "./tools.js";
+import { setAllowedRoot } from "./bars.js";
 import { NAMES, COMPAT_NAMES } from "./manifest.js";
 import { CANDLE_PATTERNS, CURATED_CANDLES, EVENT_SIGNALS } from "indicato";
 import { pathToFileURL } from "node:url";
-import { readFileSync, realpathSync } from "node:fs";
+import { readFileSync, realpathSync, statSync } from "node:fs";
 
 const VERSION = JSON.parse(
   readFileSync(new URL("../package.json", import.meta.url), "utf8")
@@ -27,9 +28,22 @@ const BARS_INPUT = {
   file: {
     type: "string",
     description:
-      "Path to a CSV or JSON file of bars on the machine running this server. " +
-      "CSV headers are matched case-insensitively against open/high/low/close/volume " +
-      "and common variants; the columns actually used are reported back.",
+      "Path to a .csv, .tsv, .txt or .json file of bars on the machine running this server " +
+      "(confined to --root / INDICATO_ROOT when set). CSV headers are matched case-insensitively " +
+      "against open/high/low/close/volume and common variants; the columns actually used are reported back.",
+  },
+  benchmark: {
+    type: "array",
+    description:
+      "Second series for two-instrument indicators (`beta`, `correlation`), aligned bar for bar " +
+      "with `bars`: numbers or `{o,h,l,c,v}` objects.",
+    items: { type: ["object", "number"] },
+  },
+  benchmarkFile: {
+    type: "string",
+    description:
+      "Path to a .csv, .tsv, .txt or .json file of benchmark bars for `beta` or `correlation`, " +
+      "subject to the same path, extension and root-confinement rules as `file`.",
   },
   tail: {
     type: "integer",
@@ -128,6 +142,8 @@ const DEFINITIONS = [
             "Names, or objects: [\"rsi\", {\"indicator\":\"ema\",\"params\":{\"n\":50}}]. An object " +
             "may carry its own `compat`.",
           items: { type: ["string", "object"] },
+          minItems: 1,
+          maxItems: MAX_INDICATORS,
         },
         compat: {
           ...COMPAT_INPUT,
@@ -235,6 +251,25 @@ export { DEFINITIONS };
  * `process.argv[1]` is the link while `import.meta.url` is its target. Comparing them raw
  * is false for every real installation and true only when the file is run by its own
  * path, which is exactly what a test does. It passes everywhere except in use. */
+function parseCliRoot(argv) {
+  let root = null;
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === "--root") {
+      const next = argv[++i];
+      if (!next || next.startsWith("-")) {
+        throw new Error("--root requires a directory path");
+      }
+      root = next;
+    } else if (arg.startsWith("--root=")) {
+      const val = arg.slice("--root=".length);
+      if (!val) throw new Error("--root requires a directory path");
+      root = val;
+    }
+  }
+  return root;
+}
+
 const entry = process.argv[1];
 if (entry) {
   let invoked;
@@ -243,5 +278,20 @@ if (entry) {
   } catch {
     invoked = pathToFileURL(entry).href;
   }
-  if (invoked === import.meta.url) server.listen();
+  if (invoked === import.meta.url) {
+    try {
+      const cliRoot = parseCliRoot(process.argv.slice(2));
+      if (cliRoot) {
+        const resolved = realpathSync(cliRoot);
+        if (!statSync(resolved).isDirectory()) {
+          throw new Error(`--root is not a directory: ${cliRoot}`);
+        }
+        setAllowedRoot(cliRoot);
+      }
+    } catch (err) {
+      process.stderr.write(`indicato-mcp: ${err.message}\n`);
+      process.exit(1);
+    }
+    server.listen();
+  }
 }
