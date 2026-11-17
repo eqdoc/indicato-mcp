@@ -227,11 +227,16 @@ Both are addressed to the model, which reads the message and corrects itself.
 
 The file system, as you, and nothing else. It opens no network connection.
 
-`file` is a path, and the thing choosing that path is a language model, which can be
-talked into things by what it reads. So a file that fails to parse is not quoted back
-into the error message — only fragments that look like column names survive, which
-`Adj Close` does and a line of a private key does not. Files are capped at 64 MB, and
-window lengths are bounded before anything is allocated.
+`file` and `benchmarkFile` only accept `.csv`, `.tsv`, `.txt` and `.json` files, and
+refuse hidden files and credential directories (`.env`, `.ssh`, `.aws`, `.gnupg`,
+`.config`). Pass `--root /path/to/exports` (or set `INDICATO_ROOT`) to confine every
+file read — symlinks included — to one directory.
+
+Because the thing choosing a path is a language model, which can be talked into things
+by what it reads, a file that fails to parse is not quoted back into the error message:
+only fragments that look like column names survive, which `Adj Close` does and a line of
+a private key does not. Files are capped at 64 MB, and window lengths and request sizes
+are bounded before anything is allocated.
 
 Point it at a directory of exports and it is useful. It has no more reach than that.
 

@@ -174,7 +174,7 @@ test("a non-numeric parameter is refused", async () => {
 
 test("an unreadable file is not quoted back into the error", async () => {
   const dir = await mkdtemp(join(tmpdir(), "indicato-sec-"));
-  const secret = join(dir, "id_rsa");
+  const secret = join(dir, "key.csv");
   await writeFile(secret,
     "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAABlwAAAAdzc2gtcn\n");
   await assert.rejects(
@@ -187,7 +187,7 @@ test("an unreadable file is not quoted back into the error", async () => {
     }
   );
 
-  const passwd = join(dir, "passwd");
+  const passwd = join(dir, "passwd.csv");
   await writeFile(passwd, "root:x:0:0:root:/root:/bin/bash\ndaemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n");
   await assert.rejects(
     () => tools.compute({ indicator: "rsi", file: passwd }),
@@ -209,7 +209,10 @@ test("a real csv header still comes back, so debugging still works", async () =>
 });
 
 test("a directory is not a file", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "indicato-dir-"));
+  const { mkdir } = await import("node:fs/promises");
+  const parent = await mkdtemp(join(tmpdir(), "indicato-dir-"));
+  const dir = join(parent, "bars.csv");
+  await mkdir(dir);
   await assert.rejects(() => tools.compute({ indicator: "rsi", file: dir }), /is not a file/);
 });
 
