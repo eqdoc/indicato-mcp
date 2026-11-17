@@ -32,7 +32,7 @@
     "node": ">=18"
   },
   "scripts": {
-    "test": "node --test 'test/*.test.js'"
+    "test": "node --test"
   },
   "dependencies": {
     "indicato": "0.3.0"
